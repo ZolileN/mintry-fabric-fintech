@@ -12,23 +12,24 @@ A two-layer FinOps proxy platform designed to sit transparently next to containe
 
 ## Getting started
 
-### 1. Generate the Root CA (one-time setup)
+### 1. Build and Test (Automated via Makefile)
+
+Make sure you have `libsqlcipher-dev` installed (`sudo apt-get install libsqlcipher-dev`).
 
 ```bash
-openssl genrsa -out mintry-root.key 4096
-openssl req -new -x509 -days 3650 -key mintry-root.key -out mintry-root.crt -subj "/CN=Mintry Fabric CA"
-```
+# Setup linkages, generate Root CA, build runtime binary and run the test suite
+make
 
-### 2. Start the Runtime
+# Or run tests specifically
+make test
 
-```bash
-cd runtime
-go mod tidy
-go run .
+# Start the runtime
+export MINTRY_SQLCIPHER_KEY="your-encryption-passphrase-here"
+make run
 ```
 
 - Configure `config.yaml` with endpoint routing rules, TTL policies, and CA certificate paths.
-- Set `MINTRY_SQLCIPHER_KEY` before launch to enable SQLCipher database encryption at rest.
+- Set `MINTRY_SQLCIPHER_KEY` to enable AES-256 database encryption at rest. If the key is incorrect or missing when opening an existing encrypted cache file, the runtime will immediately crash rather than leaking unencrypted state or corrupting the database.
 
 ### 3. Configure Client Microservices
 

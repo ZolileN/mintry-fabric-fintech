@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"sort"
@@ -434,14 +435,34 @@ type cachedResponse struct {
 
 func newCacheStore(path string) (*CacheStore, error) {
 	key := os.Getenv(encryptionKeyEnvVar)
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)", path)
+	
+	var dsn string
 	if key != "" {
-		dsn = fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma_key=%s", path, key)
+		// Pass the key via URL query parameter so SQLCipher can unlock the database
+		// during sqlite3_open_v2, before go-sqlite3 executes default pragmas.
+		// Use url.QueryEscape to ensure special characters in the key are safely encoded.
+		dsn = fmt.Sprintf("file:%s?_journal_mode=WAL&key=%s", path, url.QueryEscape(key))
+	} else {
+		dsn = fmt.Sprintf("file:%s?_journal_mode=WAL", path)
 	}
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, err
+	}
+
+	// Restrict to a single connection in the pool so write operations and transaction
+	// locks behave deterministically.
+	db.SetMaxOpenConns(1)
+
+	// If encryption key is provided, verify it immediately by performing a test query.
+	// If the key is invalid or missing on an encrypted file, the query will fail.
+	if key != "" {
+		var testVal int
+		if err := db.QueryRow("SELECT count(*) FROM sqlite_master;").Scan(&testVal); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("invalid database encryption key: %w", err)
+		}
 	}
 
 	if _, err := db.Exec(`
