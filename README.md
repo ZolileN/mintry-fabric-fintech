@@ -1,117 +1,98 @@
-# Mintry Fabric (Fintech Edition)
+# Mintry Fabric: FinOps TLS Sidecar Proxy
 
-A two-layer FinOps proxy platform designed to sit transparently next to containerized microservices.
+Mintry Fabric is a transparent, zero-touch Man-in-the-Middle (MITM) proxy designed exclusively for FinTech microservices. It intercepts, encrypts, and caches expensive third-party financial API calls (e.g., Credit Bureaus, KYC, AML checks) at the network layer, dramatically reducing your operational expenditures without requiring any code changes to your backend applications.
 
-## Workspace layout
+## Key Capabilities
 
-- `runtime/` — transparent MITM proxy runtime with TLS interception, deterministic request hashing, and SQLite WAL cache.
-- `dashboard/` — control plane dashboard scaffold built with Next.js and Tailwind CSS.
-- `mintry-root.crt` — Root CA certificate for TLS MITM interception (distributable to client services).
-- `mintry-root.key` — Root CA private key (**NEVER commit to git**).
-- `Product_Requirement_Document_Mentry_Fabric_Fintech_Edition.md` — product requirements and architecture.
-
-## Getting started
-
-### 1. Build and Test (Automated via Makefile)
-
-Make sure you have `libsqlcipher-dev` installed (`sudo apt-get install libsqlcipher-dev`).
-
-```bash
-# Setup linkages, generate Root CA, build runtime binary and run the test suite
-make
-
-# Or run tests specifically
-make test
-
-# Start the runtime
-export MINTRY_SQLCIPHER_KEY="your-encryption-passphrase-here"
-make run
-```
-
-- Configure `config.yaml` with endpoint routing rules, TTL policies, and CA certificate paths.
-- Set `MINTRY_SQLCIPHER_KEY` to enable AES-256 database encryption at rest. If the key is incorrect or missing when opening an existing encrypted cache file, the runtime will immediately crash rather than leaking unencrypted state or corrupting the database.
-
-### 3. Configure Client Microservices
-
-For MITM interception to work, client services must:
-
-1. **Trust the Mintry Root CA** — add `mintry-root.crt` to their certificate store.
-2. **Route traffic through the proxy** — set `HTTP_PROXY=http://localhost:8080` and `HTTPS_PROXY=http://localhost:8080`.
-
-```bash
-# Example: trust the CA system-wide on Ubuntu/Debian
-sudo cp mintry-root.crt /usr/local/share/ca-certificates/mintry-root.crt
-sudo update-ca-certificates
-
-# Example: set proxy for a single service
-export HTTP_PROXY=http://localhost:8080
-export HTTPS_PROXY=http://localhost:8080
-```
-
-### 4. Start the Dashboard
-
-```bash
-cd dashboard
-npm install
-npm run dev
-```
+- **Zero-Touch Integration:** Operates entirely at the network layer. Simply set `HTTP_PROXY` and `HTTPS_PROXY` in your application container, and the Sidecar handles the rest.
+- **SQLCipher Encrypted Storage:** Sensitive intercepted PII and financial payloads are cached in a military-grade AES-256 encrypted SQLite write-ahead log database.
+- **Dynamic Routing Policies:** Define TTL (Time-To-Live) cache invalidation rules per vendor endpoint using hot-reloadable YAML configurations.
+- **Failsafe Resilience:** Built with an aggressive Circuit Breaker architecture. If the encrypted disk locks or fills up, the proxy degrades gracefully to a transparent pass-through mode—your app never goes offline.
+- **Telemetry Dashboard:** A stunning Next.js command center tracking ZAR capital saved, real-time cache hits via WebSockets, and system memory allocations.
 
 ---
 
-## Architecture
+## 1. Production Architecture (Sidecar Pattern)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Client Microservice                          │
-│  (Onboarding, Credit, Fraud — zero code changes required)      │
-│  Trusts mintry-root.crt · Routes via HTTPS_PROXY               │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ CONNECT api.transunion.co.za:443
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    Mintry Fabric Runtime (:8080)                 │
-│                                                                  │
-│  1. TLS MITM — signs dynamic cert using Mintry Root CA           │
-│  2. Payload Extraction — reads decrypted JSON body               │
-│  3. Deterministic Hashing — strips timestamps, sorts keys,      │
-│     generates SHA-256 cache key                                  │
-│  4. SQLite WAL Lookup:                                           │
-│     ├── HIT  → return cached response (sub-ms)                  │
-│     └── MISS → forward to vendor, cache response on return       │
-│                                                                  │
-│  Non-vendor traffic passes through completely untouched.         │
-└──────────────────────────────────────────────────────────────────┘
-```
+Mintry Fabric is designed to be deployed as a **Sidecar Container** running in the exact same network space (or Kubernetes Pod) as your client microservice. This eliminates network latency and centralizes certificate trust securely.
 
-## Design goals
-
-- Zero-touch deployment as a transparent MITM proxy sidecar.
-- Cache duplicate outbound HTTPS verification requests.
-- Maintain compliance with POPIA/GDPR using encrypted local storage.
-- Provide an operational dashboard for policy configuration and telemetry.
+### Prerequisites
+- Docker & Docker Compose
+- Node.js 18+ (for running the Dashboard locally)
 
 ---
 
-## Supported Vendors
+## 2. Deployment Instructions
 
-Mintry Fabric ships with pre-configured routes for **15 South African fintech data suppliers** across 4 categories. TTLs are calibrated to each data type's volatility.
+### Step 1: Secure the Configuration
+Ensure you have generated the custom Root CA certificates for the MITM interception:
+- `mintry-root.crt`
+- `mintry-root.key`
 
-| Category | Vendor | Default TTL | Rationale |
-|---|---|---|---|
-| **Credit, Risk & Property** | TransUnion SA | 30d | Credit scores update monthly |
-| | Experian SA | 30d | |
-| | Compuscan | 30d | |
-| | XDS | 30d | |
-| | Lightstone | 30d | Property valuations are slow-moving |
-| **Identity & KYC/KYB** | Smile ID | 90d | Identity data rarely changes |
-| | PBVerify | 90d | Home Affairs, CIPC lookups |
-| | ThisIsMe | 90d | |
-| | Windeed (LexisNexis) | 30d | Deeds & corporate records |
-| **Bank Verification & Open Banking** | BankservAfrica (AVS) | 7d | Account status can change |
-| | Stitch | 1d | Transactional data is live |
-| | TrueLayer | 1d | |
-| | Mono | 1d | |
-| **AML & Sanctions** | ComplyAdvantage | 7d | Sanctions lists update weekly |
-| | Dow Jones Risk & Compliance | 7d | |
+Place these in the root of the repository alongside `docker-compose.yml`.
 
-All routes are defined in [`runtime/config.yaml`](runtime/config.yaml). To add a new vendor, append a route entry with the endpoint pattern and desired TTL.
+### Step 2: Set the Encryption Key
+The Fabric requires a symmetric key to unlock the SQLCipher database. Export this variable in your environment or CI/CD pipeline:
+```bash
+export MINTRY_SQLCIPHER_KEY="your_super_secret_aes_key"
+```
+
+### Step 3: Launch the Sidecar
+Use the provided `docker-compose.yml` to orchestrate the multi-stage proxy build alongside your application container.
+
+```bash
+docker-compose up --build -d
+```
+
+### Step 4: Automate Certificate Injection
+Your client microservice must trust the Mintry Root CA to prevent TLS handshake errors. If you are using Alpine Linux inside your application container, run the following on startup:
+
+```bash
+apk add --no-cache ca-certificates
+# (Assuming the cert is mounted to /usr/local/share/ca-certificates/mintry-root.crt)
+update-ca-certificates
+```
+
+Inject the proxy routing environment variables into your application runtime:
+```env
+HTTP_PROXY=http://mintry-sidecar:8080
+HTTPS_PROXY=http://mintry-sidecar:8080
+```
+
+All outbound traffic will now intelligently route through the Mintry Fabric!
+
+---
+
+## 3. Dashboard Command Center
+
+The telemetry dashboard is a Next.js application that provides real-time observability into the proxy's operations, powered by the Mintry Neon-Grid aesthetic.
+
+1. Navigate to the `dashboard/` directory.
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Start the dashboard in development or production mode:
+   ```bash
+   npm run dev
+   ```
+4. Access the command center at `http://localhost:3000`.
+
+The dashboard communicates with the Fabric runtime over WebSockets (`ws://localhost:8081/ws/feed`) and REST APIs (`http://localhost:8081/api/routes`) to stream live interception telemetry and manage YAML routing policies dynamically.
+
+---
+
+## 4. Testing & Benchmarking
+
+The core runtime includes an aggressive Go Race Detector stress-testing suite to guarantee memory constraints and Write-Ahead Log (WAL) safety under load.
+
+To verify thread-safety and SQLite locking resilience on your local machine:
+```bash
+cd runtime
+CGO_ENABLED=1 go test -v -run=TestConcurrency -race
+```
+*(This simulates 15,000+ parallel goroutines hammering the circuit breakers and ring buffers.)*
+
+---
+
+**Mintry Fabric:** Close the attribution void and reclaim your API budget.
