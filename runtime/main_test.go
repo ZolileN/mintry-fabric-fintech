@@ -103,3 +103,58 @@ func TestBuildCacheKeyDiffersForQueryOrMethod(t *testing.T) {
 		t.Fatalf("expected different cache keys for different queries, got %q", keyGet)
 	}
 }
+
+func TestExtractVendorHosts(t *testing.T) {
+	cfg := &Config{
+		Routes: []RouteConfig{
+			{Match: "api.transunion.co.za/v1/score", TTL: "30d"},
+			{Match: "api.transunion.co.za/v1/consumer", TTL: "14d"},
+			{Match: "api.smileid.com/v1/async/verify", TTL: "7d"},
+		},
+	}
+
+	hosts := extractVendorHosts(cfg)
+	if len(hosts) != 2 {
+		t.Fatalf("expected 2 unique hosts, got %d: %v", len(hosts), hosts)
+	}
+
+	hostSet := make(map[string]bool)
+	for _, h := range hosts {
+		hostSet[h] = true
+	}
+
+	if !hostSet["api.transunion.co.za"] {
+		t.Fatal("expected api.transunion.co.za in extracted hosts")
+	}
+	if !hostSet["api.smileid.com"] {
+		t.Fatal("expected api.smileid.com in extracted hosts")
+	}
+}
+
+func TestFindRoute(t *testing.T) {
+	cfg := &Config{
+		Routes: []RouteConfig{
+			{Match: "api.transunion.co.za/v1/score", TTL: "30d"},
+			{Match: "api.smileid.com/v1/async/verify", TTL: "7d"},
+		},
+	}
+
+	// Should match
+	req1, _ := http.NewRequest(http.MethodPost, "https://api.transunion.co.za/v1/score", nil)
+	req1.Host = "api.transunion.co.za"
+	route := findRoute(req1, cfg)
+	if route == nil {
+		t.Fatal("expected route match for api.transunion.co.za/v1/score")
+	}
+	if route.TTL != "30d" {
+		t.Fatalf("expected TTL 30d, got %s", route.TTL)
+	}
+
+	// Should not match
+	req2, _ := http.NewRequest(http.MethodGet, "https://api.google.com/maps", nil)
+	req2.Host = "api.google.com"
+	route2 := findRoute(req2, cfg)
+	if route2 != nil {
+		t.Fatal("expected no route match for api.google.com")
+	}
+}

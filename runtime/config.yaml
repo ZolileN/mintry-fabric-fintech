@@ -1,7 +1,180 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Mintry Fabric Runtime Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Only traffic matching these routes is intercepted and cached.
+# All other outbound traffic passes through the proxy transparently.
+#
+# TTL Guidelines:
+#   - Identity/KYC data rarely changes        → 90d
+#   - Credit scores update monthly             → 30d
+#   - Property valuations are slow-moving      → 30d
+#   - AML/sanctions lists update weekly        → 7d
+#   - Bank account verification is sensitive   → 7d
+#   - Open banking transactional data is live  → 1d
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# TLS MITM Certificate Authority
+ca_cert: "../mintry-root.crt"
+ca_key: "../mintry-root.key"
+
 routes:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CREDIT, RISK & PROPERTY
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # TransUnion South Africa — credit scores & consumer reports
   - match: "api.transunion.co.za/v1/score"
     ttl: "30d"
     cache_errors: false
+
+  - match: "api.transunion.co.za/v1/consumer"
+    ttl: "30d"
+    cache_errors: false
+
+  # Experian South Africa — credit bureau data
+  - match: "api.experian.co.za/v1/credit"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.experian.co.za/v1/consumer-report"
+    ttl: "30d"
+    cache_errors: false
+
+  # Compuscan — credit & affordability assessments
+  - match: "api.compuscan.co.za/v1/enquiry"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.compuscan.co.za/v1/affordability"
+    ttl: "30d"
+    cache_errors: false
+
+  # XDS (Xpert Decision Systems) — alternative credit bureau
+  - match: "api.xds.co.za/v1/credit-report"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.xds.co.za/v1/score"
+    ttl: "30d"
+    cache_errors: false
+
+  # Lightstone — property valuations & analytics
+  - match: "api.lightstone.co.za/v1/property"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.lightstone.co.za/v1/valuation"
+    ttl: "30d"
+    cache_errors: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # IDENTITY & CORPORATE VERIFICATION (KYC / KYB)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # Smile ID — biometric & identity verification (Africa-wide)
   - match: "api.smileid.com/v1/async/verify"
+    ttl: "90d"
+    cache_errors: false
+
+  - match: "api.smileid.com/v1/id_verification"
+    ttl: "90d"
+    cache_errors: false
+
+  # PBVerify — SA Home Affairs, CIPC & identity lookups
+  - match: "api.pbverify.co.za/v1/verify"
+    ttl: "90d"
+    cache_errors: false
+
+  - match: "api.pbverify.co.za/v1/home-affairs"
+    ttl: "90d"
+    cache_errors: false
+
+  - match: "api.pbverify.co.za/v1/cipc"
+    ttl: "30d"
+    cache_errors: false
+
+  # ThisIsMe — digital identity verification
+  - match: "api.thisisme.com/v1/verify"
+    ttl: "90d"
+    cache_errors: false
+
+  - match: "api.thisisme.com/v1/identity"
+    ttl: "90d"
+    cache_errors: false
+
+  # Windeed (LexisNexis) — deeds office, corporate & property records
+  - match: "api.windeed.co.za/v1/search"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.windeed.co.za/v1/deeds"
+    ttl: "30d"
+    cache_errors: false
+
+  - match: "api.windeed.co.za/v1/company"
+    ttl: "30d"
+    cache_errors: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # BANK ACCOUNT VERIFICATION & OPEN BANKING
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # BankservAfrica — Account Verification Service (AVS)
+  - match: "api.bankservafrica.com/v1/avs"
+    ttl: "7d"
+    cache_errors: false
+
+  - match: "api.bankservafrica.com/v1/verify"
+    ttl: "7d"
+    cache_errors: false
+
+  # Stitch — open banking aggregation (SA)
+  - match: "api.stitch.money/v1/accounts"
+    ttl: "1d"
+    cache_errors: false
+
+  - match: "api.stitch.money/v1/transactions"
+    ttl: "1d"
+    cache_errors: false
+
+  # TrueLayer — open banking API
+  - match: "api.truelayer.com/v1/accounts"
+    ttl: "1d"
+    cache_errors: false
+
+  - match: "api.truelayer.com/v1/transactions"
+    ttl: "1d"
+    cache_errors: false
+
+  # Mono — financial data API (Africa)
+  - match: "api.mono.co/v1/accounts"
+    ttl: "1d"
+    cache_errors: false
+
+  - match: "api.mono.co/v1/transactions"
+    ttl: "1d"
+    cache_errors: false
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # AML & SANCTIONS SCREENING
+  # ──────────────────────────────────────────────────────────────────────────
+
+  # ComplyAdvantage — AML screening & adverse media
+  - match: "api.complyadvantage.com/v1/searches"
+    ttl: "7d"
+    cache_errors: false
+
+  - match: "api.complyadvantage.com/v1/monitors"
+    ttl: "7d"
+    cache_errors: false
+
+  # Dow Jones Risk & Compliance — sanctions & PEP screening
+  - match: "api.dowjones.com/risk/v1/screening"
+    ttl: "7d"
+    cache_errors: false
+
+  - match: "api.dowjones.com/risk/v1/watchlist"
     ttl: "7d"
     cache_errors: false

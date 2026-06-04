@@ -3,13 +3,15 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -17,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elazarl/goproxy"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mintryfabric/mintry-fabric-runtime/internal/cache"
 	"gopkg.in/yaml.v3"
@@ -32,20 +35,12 @@ const (
 
 var dynamicMetadataKeys = []string{"timestamp", "requestId", "clientNonce", "nonce", "correlationId", "x-request-id"}
 
-var hopByHopHeaders = []string{
-	"Connection",
-	"Proxy-Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"TE",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
 // Global telemetry tracker
 var telemetry *cache.Telemetry
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 // RouteConfig defines a caching rule for a matched vendor endpoint.
 type RouteConfig struct {
@@ -56,13 +51,28 @@ type RouteConfig struct {
 
 // Config defines the runtime rule engine.
 type Config struct {
+	CACert string        `yaml:"ca_cert"`
+	CAKey  string        `yaml:"ca_key"`
 	Routes []RouteConfig `yaml:"routes"`
 }
 
-// CacheStore manages the local SQLite cache backed by WAL.
-type CacheStore struct {
-	db *sql.DB
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
 }
+
+// ---------------------------------------------------------------------------
+// Entry Point
+// ---------------------------------------------------------------------------
 
 func main() {
 	telemetry = cache.NewTelemetry()
@@ -79,37 +89,303 @@ func main() {
 	defer store.db.Close()
 
 	go store.pruneExpiredLoop()
-
-	// Start telemetry server on separate port
 	go startTelemetryServer()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handleProxy(w, r, config, store)
-	})
-
-	server := &http.Server{
-		Addr:    defaultListenAddr,
-		Handler: handler,
-	}
-
-	log.Printf("Mintry Fabric runtime listening on %s", defaultListenAddr)
-	log.Printf("Telemetry metrics available on http://localhost%s/metrics", defaultTelemetryAddr)
-	log.Fatal(server.ListenAndServe())
-}
-
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	// Load CA certificate for MITM interception
+	mintryCA, err := loadMintryCA(config.CACert, config.CAKey)
 	if err != nil {
-		return nil, err
+		log.Fatalf("failed to load Mintry CA: %v", err)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, err
+	// Extract unique vendor hosts from configured routes
+	vendorHosts := extractVendorHosts(config)
+
+	// Build the MITM ConnectAction using our custom CA
+	mitmAction := &goproxy.ConnectAction{
+		Action:    goproxy.ConnectMitm,
+		TLSConfig: goproxy.TLSConfigFromCA(&mintryCA),
 	}
 
-	return &cfg, nil
+	// Create goproxy instance
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = false
+
+	// MITM: intercept CONNECT only for configured vendor hosts.
+	// All other HTTPS traffic tunnels through untouched.
+	proxy.OnRequest(vendorHostCondition(vendorHosts)).HandleConnectFunc(
+		func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+			log.Printf("MITM INTERCEPT: %s", host)
+			return mitmAction, host
+		},
+	)
+
+	// After TLS decryption: check cache before forwarding to vendor.
+	proxy.OnRequest(vendorRouteCondition(config)).DoFunc(
+		makeCacheRequestHandler(config, store),
+	)
+
+	// After vendor response: cache the result for future hits.
+	proxy.OnResponse(vendorRouteCondition(config)).DoFunc(
+		makeCacheResponseHandler(config, store),
+	)
+
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("  Mintry Fabric Runtime v0.2.0")
+	log.Printf("  Proxy listening on         %s", defaultListenAddr)
+	log.Printf("  Telemetry endpoint         http://localhost%s/metrics", defaultTelemetryAddr)
+	log.Printf("  MITM enabled for %d vendor host(s):", len(vendorHosts))
+	for _, h := range vendorHosts {
+		log.Printf("    → %s", h)
+	}
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	log.Fatal(http.ListenAndServe(defaultListenAddr, proxy))
 }
+
+// ---------------------------------------------------------------------------
+// TLS MITM — CA Loading
+// ---------------------------------------------------------------------------
+
+func loadMintryCA(certPath, keyPath string) (tls.Certificate, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("reading CA cert %q: %w", certPath, err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("reading CA key %q: %w", keyPath, err)
+	}
+
+	ca, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("parsing CA key pair: %w", err)
+	}
+
+	// Parse the leaf certificate so goproxy can sign dynamic certs
+	if ca.Leaf == nil {
+		block, _ := pem.Decode(certPEM)
+		if block == nil {
+			return tls.Certificate{}, fmt.Errorf("failed to decode CA cert PEM block")
+		}
+		ca.Leaf, err = x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("parsing CA leaf certificate: %w", err)
+		}
+	}
+
+	log.Printf("Loaded Mintry Root CA: CN=%s (expires %s)",
+		ca.Leaf.Subject.CommonName,
+		ca.Leaf.NotAfter.Format("2006-01-02"),
+	)
+
+	return ca, nil
+}
+
+// ---------------------------------------------------------------------------
+// TLS MITM — Condition Matching
+// ---------------------------------------------------------------------------
+
+// extractVendorHosts pulls unique hostnames from the route config.
+// e.g. "api.transunion.co.za/v1/score" → "api.transunion.co.za"
+func extractVendorHosts(cfg *Config) []string {
+	seen := make(map[string]struct{})
+	var hosts []string
+	for _, route := range cfg.Routes {
+		parts := strings.SplitN(route.Match, "/", 2)
+		host := strings.ToLower(parts[0])
+		if _, ok := seen[host]; !ok {
+			seen[host] = struct{}{}
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
+// vendorHostCondition matches CONNECT requests destined for configured vendor hosts.
+// Ports are stripped from both sides so "127.0.0.1:45678" matches config host "127.0.0.1:45678".
+func vendorHostCondition(hosts []string) goproxy.ReqConditionFunc {
+	// Pre-normalize config hosts to bare hostnames
+	cleanHosts := make([]string, len(hosts))
+	for i, h := range hosts {
+		cleanHosts[i] = stripPort(h)
+	}
+
+	return func(req *http.Request, ctx *goproxy.ProxyCtx) bool {
+		reqHost := stripPort(strings.ToLower(req.URL.Host))
+		for _, h := range cleanHosts {
+			if reqHost == h {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// stripPort removes the :port suffix from a host string.
+func stripPort(host string) string {
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		return host[:idx]
+	}
+	return host
+}
+
+// vendorRouteCondition matches decrypted requests against full host+path route patterns.
+func vendorRouteCondition(cfg *Config) goproxy.ReqConditionFunc {
+	return func(req *http.Request, ctx *goproxy.ProxyCtx) bool {
+		return findRoute(req, cfg) != nil
+	}
+}
+
+// findRoute returns the first matching route config for a request.
+func findRoute(r *http.Request, cfg *Config) *RouteConfig {
+	target := strings.ToLower(r.Host + r.URL.Path)
+	for _, route := range cfg.Routes {
+		if strings.Contains(target, strings.ToLower(route.Match)) {
+			return &route
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// TLS MITM — Request & Response Handlers
+// ---------------------------------------------------------------------------
+
+// proxyContext carries state between the OnRequest and OnResponse handlers
+// via goproxy's ctx.UserData field.
+type proxyContext struct {
+	cacheKey string
+	route    *RouteConfig
+	reqStart time.Time
+}
+
+// makeCacheRequestHandler returns a goproxy OnRequest handler that checks
+// the local cache before allowing the request to reach the vendor.
+func makeCacheRequestHandler(cfg *Config, store *CacheStore) func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+	return func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		route := findRoute(req, cfg)
+		if route == nil {
+			return req, nil
+		}
+
+		// Read and buffer the request body for cache key generation
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			log.Printf("[WARN] failed reading request body: %v", err)
+			return req, nil // forward to vendor
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+
+		cacheKey, err := buildCacheKey(req, body)
+		if err != nil {
+			log.Printf("[WARN] failed building cache key: %v", err)
+			return req, nil
+		}
+
+		// Attempt cache lookup
+		cached, found, err := store.get(cacheKey)
+		if err != nil {
+			log.Printf("[WARN] cache get error: %v", err)
+		}
+
+		if found {
+			// ── CACHE HIT ──────────────────────────────────────────
+			start := time.Now()
+			resp := buildCachedHTTPResponse(req, cached)
+			latencyMS := float64(time.Since(start).Microseconds()) / 1000.0
+			telemetry.RecordCacheHit(req.Host+req.URL.Path, latencyMS)
+			log.Printf("⚡ CACHE HIT  %s%s  (%.2fms)", req.Host, req.URL.Path, latencyMS)
+			return req, resp // short-circuit — vendor is never called
+		}
+
+		// ── CACHE MISS ─────────────────────────────────────────
+		// Stash context for the OnResponse handler
+		ctx.UserData = &proxyContext{
+			cacheKey: cacheKey,
+			route:    route,
+			reqStart: time.Now(),
+		}
+		return req, nil // forward to vendor
+	}
+}
+
+// makeCacheResponseHandler returns a goproxy OnResponse handler that caches
+// successful vendor responses for future deduplication.
+func makeCacheResponseHandler(cfg *Config, store *CacheStore) func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+	return func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		pctx, ok := ctx.UserData.(*proxyContext)
+		if !ok || pctx == nil {
+			return resp // this was a cache hit — nothing to store
+		}
+
+		endpoint := ctx.Req.Host + ctx.Req.URL.Path
+		latencyMS := float64(time.Since(pctx.reqStart).Milliseconds())
+
+		// Only cache 200 OK unless cache_errors is enabled
+		if resp.StatusCode != http.StatusOK && !pctx.route.CacheErrors {
+			telemetry.RecordVendorCall(endpoint, latencyMS)
+			log.Printf("🌐 VENDOR CALL %s  (%dms, status %d — not cached)",
+				endpoint, int(latencyMS), resp.StatusCode)
+			return resp
+		}
+
+		// Read the vendor response body
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[WARN] failed reading vendor response body: %v", err)
+			telemetry.RecordVendorCall(endpoint, latencyMS)
+			return resp
+		}
+		// Put it back for the client
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+
+		// Parse TTL and commit to cache
+		ttl, err := parseTTL(pctx.route.TTL)
+		if err != nil {
+			log.Printf("[WARN] invalid TTL for route %s: %v", pctx.route.Match, err)
+			telemetry.RecordVendorCall(endpoint, latencyMS)
+			return resp
+		}
+
+		cachedResp := &cachedResponse{
+			Status:  resp.StatusCode,
+			Headers: resp.Header.Clone(),
+			Body:    body,
+		}
+
+		if err := store.put(pctx.cacheKey, cachedResp, ttl); err != nil {
+			log.Printf("[WARN] failed to write cache entry: %v", err)
+		} else {
+			log.Printf("💾 CACHED     %s  (TTL: %s, %d bytes)", endpoint, pctx.route.TTL, len(body))
+		}
+
+		telemetry.RecordVendorCall(endpoint, latencyMS)
+		return resp
+	}
+}
+
+// buildCachedHTTPResponse constructs a full HTTP response from a cached entry,
+// ready to be returned by goproxy without ever contacting the vendor.
+func buildCachedHTTPResponse(req *http.Request, cached *cachedResponse) *http.Response {
+	header := cached.Headers.Clone()
+	header.Set("X-Mintry-Cache", "HIT")
+
+	return &http.Response{
+		StatusCode:    cached.Status,
+		Status:        fmt.Sprintf("%d %s", cached.Status, http.StatusText(cached.Status)),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        header,
+		Body:          io.NopCloser(bytes.NewReader(cached.Body)),
+		ContentLength: int64(len(cached.Body)),
+		Request:       req,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry Server
+// ---------------------------------------------------------------------------
 
 func startTelemetryServer() {
 	mux := http.NewServeMux()
@@ -136,9 +412,24 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	memoryUsageMB := float64(m.Alloc) / 1024 / 1024
 
 	// Get current stats from telemetry tracker
-	stats := telemetry.GetStats(memoryUsageMB, 0) // Active connections would come from connection tracking
+	stats := telemetry.GetStats(memoryUsageMB, 0)
 
 	json.NewEncoder(w).Encode(stats)
+}
+
+// ---------------------------------------------------------------------------
+// SQLite WAL Cache Store
+// ---------------------------------------------------------------------------
+
+// CacheStore manages the local SQLite cache backed by WAL.
+type CacheStore struct {
+	db *sql.DB
+}
+
+type cachedResponse struct {
+	Status  int
+	Headers http.Header
+	Body    []byte
 }
 
 func newCacheStore(path string) (*CacheStore, error) {
@@ -227,163 +518,14 @@ func (s *CacheStore) put(key string, resp *cachedResponse, ttl time.Duration) er
 	return err
 }
 
-func handleProxy(w http.ResponseWriter, r *http.Request, cfg *Config, store *CacheStore) {
-	if r.Method == http.MethodConnect {
-		handleConnect(w, r)
-		return
-	}
-
-	matchRoute := findRoute(r, cfg)
-	if matchRoute == nil {
-		proxyDirect(w, r)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("failed reading request body: %v", err)
-		proxyDirect(w, r)
-		return
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-
-	cacheKey, err := buildCacheKey(r, body)
-	if err != nil {
-		log.Printf("failed building cache key: %v", err)
-		proxyDirect(w, r)
-		return
-	}
-
-	cached, found, err := store.get(cacheKey)
-	if err != nil {
-		log.Printf("cache get error: %v", err)
-	}
-	if found {
-		start := time.Now()
-		writeCachedResponse(w, cached)
-		latencyMS := float64(time.Since(start).Microseconds()) / 1000
-		telemetry.RecordCacheHit(r.Host+r.URL.Path, latencyMS)
-		return
-	}
-
-	proxyResponse, err := proxyRequest(r)
-	if err != nil {
-		log.Printf("proxy request failed: %v", err)
-		http.Error(w, "proxy failure", http.StatusBadGateway)
-		return
-	}
-	defer proxyResponse.Body.Close()
-
-	respBody, err := io.ReadAll(proxyResponse.Body)
-	if err != nil {
-		log.Printf("failed reading response body: %v", err)
-		http.Error(w, "response read error", http.StatusBadGateway)
-		return
-	}
-
-	// Record vendor call with latency (start was before proxyRequest)
-	start := time.Now()
-	copyHeaders(w.Header(), proxyResponse.Header)
-	w.WriteHeader(proxyResponse.StatusCode)
-	if _, err := w.Write(respBody); err != nil {
-		log.Printf("failed writing response body: %v", err)
-	}
-	latencyMS := float64(time.Since(start).Microseconds()) / 1000
-	telemetry.RecordVendorCall(r.Host+r.URL.Path, latencyMS)
-
-	if proxyResponse.StatusCode == http.StatusOK || matchRoute.CacheErrors {
-		cachedResp := &cachedResponse{Status: proxyResponse.StatusCode, Headers: proxyResponse.Header, Body: respBody}
-		ttl, err := parseTTL(matchRoute.TTL)
-		if err != nil {
-			log.Printf("invalid TTL for route %s: %v", matchRoute.Match, err)
-			return
-		}
-		if err := store.put(cacheKey, cachedResp, ttl); err != nil {
-			log.Printf("failed to write cache entry: %v", err)
-		}
-	}
-}
-
-func handleConnect(w http.ResponseWriter, r *http.Request) {
-	target := r.Host
-	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
-	if err != nil {
-		log.Printf("connect dial error: %v", err)
-		http.Error(w, "failed to establish tunnel", http.StatusServiceUnavailable)
-		return
-	}
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		log.Printf("hijack error: %v", err)
-		return
-	}
-
-	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	if err != nil {
-		clientConn.Close()
-		conn.Close()
-		return
-	}
-
-	go copyStream(conn, clientConn)
-	copyStream(clientConn, conn)
-}
-
-func copyStream(dst net.Conn, src net.Conn) {
-	defer dst.Close()
-	defer src.Close()
-	io.Copy(dst, src)
-}
-
-func proxyDirect(w http.ResponseWriter, r *http.Request) {
-	resp, err := proxyRequest(r)
-	if err != nil {
-		log.Printf("proxyRequest error: %v", err)
-		http.Error(w, "proxy failure", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
-
-func proxyRequest(r *http.Request) (*http.Response, error) {
-	req := r.Clone(r.Context())
-	req.RequestURI = ""
-
-	if req.URL.Scheme == "" {
-		req.URL.Scheme = defaultRequestScheme(r)
-	}
-	if req.URL.Host == "" {
-		req.URL.Host = r.Host
-	}
-
-	sanitizeHeaders(req.Header)
-	return http.DefaultTransport.RoundTrip(req)
-}
-
-func findRoute(r *http.Request, cfg *Config) *RouteConfig {
-	target := strings.ToLower(r.Host + r.URL.Path)
-	for _, route := range cfg.Routes {
-		if strings.Contains(target, strings.ToLower(route.Match)) {
-			return &route
-		}
-	}
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Deterministic Cache Key Generation
+// ---------------------------------------------------------------------------
 
 func buildCacheKey(r *http.Request, body []byte) (string, error) {
 	scheme := r.URL.Scheme
 	if scheme == "" {
-		scheme = defaultRequestScheme(r)
+		scheme = "https"
 	}
 	target := fmt.Sprintf("%s://%s%s", scheme, strings.ToLower(r.Host), r.URL.RequestURI())
 	normalized := string(body)
@@ -451,29 +593,6 @@ func isDynamicMetadataKey(key string) bool {
 	return false
 }
 
-func defaultRequestScheme(r *http.Request) string {
-	if r.URL.Scheme != "" {
-		return r.URL.Scheme
-	}
-	if r.TLS != nil {
-		return "https"
-	}
-	return "https"
-}
-
-func sanitizeHeaders(headers http.Header) {
-	connectionHeader := headers.Get("Connection")
-	if connectionHeader != "" {
-		for _, field := range strings.Split(connectionHeader, ",") {
-			headers.Del(strings.TrimSpace(field))
-		}
-	}
-
-	for _, name := range hopByHopHeaders {
-		headers.Del(name)
-	}
-}
-
 func parseTTL(ttl string) (time.Duration, error) {
 	if strings.HasSuffix(ttl, "d") {
 		number := strings.TrimSuffix(ttl, "d")
@@ -484,40 +603,4 @@ func parseTTL(ttl string) (time.Duration, error) {
 		return value * 24, nil
 	}
 	return time.ParseDuration(ttl)
-}
-
-type cachedResponse struct {
-	Status  int
-	Headers http.Header
-	Body    []byte
-}
-
-func writeCachedResponse(w http.ResponseWriter, cached *cachedResponse) {
-	copyHeaders(w.Header(), cached.Headers)
-	w.WriteHeader(cached.Status)
-	if _, err := w.Write(cached.Body); err != nil {
-		log.Printf("failed writing cached response body: %v", err)
-	}
-}
-
-func copyHeaders(dst, src http.Header) {
-	skipHeaders := map[string]struct{}{}
-	for _, name := range hopByHopHeaders {
-		skipHeaders[strings.ToLower(name)] = struct{}{}
-	}
-
-	if connectionHeader := src.Get("Connection"); connectionHeader != "" {
-		for _, field := range strings.Split(connectionHeader, ",") {
-			skipHeaders[strings.ToLower(strings.TrimSpace(field))] = struct{}{}
-		}
-	}
-
-	for key, values := range src {
-		if _, skip := skipHeaders[strings.ToLower(key)]; skip {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
 }

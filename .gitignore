@@ -42,5 +42,12 @@ out/
 Thumbs.db
 .DS_Store
 
+# Security — NEVER commit CA private keys
+mintry-root.key
+*.key
+
+# Compiled Go binaries
+mintry-fabric-runtime
+
 # Generated files
 *.bundle.js
