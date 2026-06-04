@@ -12,18 +12,22 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/mintryfabric/mintry-fabric-runtime/internal/cache"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	defaultListenAddr   = ":8080"
-	defaultDBPath       = "cache.db"
-	encryptionKeyEnvVar = "MINTRY_SQLCIPHER_KEY"
+	defaultListenAddr            = ":8080"
+	defaultTelemetryAddr         = ":8081"
+	defaultDBPath                = "cache.db"
+	encryptionKeyEnvVar          = "MINTRY_SQLCIPHER_KEY"
+	costPerCallZAR       float64 = 46.50 // Estimated cost per vendor call in ZAR
 )
 
 var dynamicMetadataKeys = []string{"timestamp", "requestId", "clientNonce", "nonce", "correlationId", "x-request-id"}
@@ -39,6 +43,9 @@ var hopByHopHeaders = []string{
 	"Transfer-Encoding",
 	"Upgrade",
 }
+
+// Global telemetry tracker
+var telemetry *cache.Telemetry
 
 // RouteConfig defines a caching rule for a matched vendor endpoint.
 type RouteConfig struct {
@@ -58,6 +65,8 @@ type CacheStore struct {
 }
 
 func main() {
+	telemetry = cache.NewTelemetry()
+
 	config, err := loadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
@@ -71,6 +80,9 @@ func main() {
 
 	go store.pruneExpiredLoop()
 
+	// Start telemetry server on separate port
+	go startTelemetryServer()
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handleProxy(w, r, config, store)
 	})
@@ -81,6 +93,7 @@ func main() {
 	}
 
 	log.Printf("Mintry Fabric runtime listening on %s", defaultListenAddr)
+	log.Printf("Telemetry metrics available on http://localhost%s/metrics", defaultTelemetryAddr)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -96,6 +109,36 @@ func loadConfig(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func startTelemetryServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", handleTelemetry)
+
+	server := &http.Server{
+		Addr:    defaultTelemetryAddr,
+		Handler: mux,
+	}
+
+	log.Printf("Telemetry server started on %s", defaultTelemetryAddr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("telemetry server error: %v", err)
+	}
+}
+
+func handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Get memory stats
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	memoryUsageMB := float64(m.Alloc) / 1024 / 1024
+
+	// Get current stats from telemetry tracker
+	stats := telemetry.GetStats(memoryUsageMB, 0) // Active connections would come from connection tracking
+
+	json.NewEncoder(w).Encode(stats)
 }
 
 func newCacheStore(path string) (*CacheStore, error) {
@@ -216,7 +259,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request, cfg *Config, store *Cac
 		log.Printf("cache get error: %v", err)
 	}
 	if found {
+		start := time.Now()
 		writeCachedResponse(w, cached)
+		latencyMS := float64(time.Since(start).Microseconds()) / 1000
+		telemetry.RecordCacheHit(r.Host+r.URL.Path, latencyMS)
 		return
 	}
 
@@ -235,11 +281,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request, cfg *Config, store *Cac
 		return
 	}
 
+	// Record vendor call with latency (start was before proxyRequest)
+	start := time.Now()
 	copyHeaders(w.Header(), proxyResponse.Header)
 	w.WriteHeader(proxyResponse.StatusCode)
 	if _, err := w.Write(respBody); err != nil {
 		log.Printf("failed writing response body: %v", err)
 	}
+	latencyMS := float64(time.Since(start).Microseconds()) / 1000
+	telemetry.RecordVendorCall(r.Host+r.URL.Path, latencyMS)
 
 	if proxyResponse.StatusCode == http.StatusOK || matchRoute.CacheErrors {
 		cachedResp := &cachedResponse{Status: proxyResponse.StatusCode, Headers: proxyResponse.Header, Body: respBody}

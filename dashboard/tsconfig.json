@@ -6,6 +6,10 @@
       "dom.iterable",
       "es2020"
     ],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    },
     "allowJs": false,
     "skipLibCheck": true,
     "strict": true,
