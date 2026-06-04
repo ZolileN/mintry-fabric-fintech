@@ -68,25 +68,23 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
   return (
     <html lang="en">
-      <body className="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-200 antialiased">
-        <div className="flex flex-col md:flex-row min-h-screen">
+      <head>
+        <title>Mintry Fabric — Logic Interceptor</title>
+        <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90" fill="%2300E5A3" font-family="sans-serif" font-weight="900">M</text></svg>' />
+      </head>
+      <body className="antialiased">
+        <div className="grid-bg" />
+        <div className="flex flex-col md:flex-row min-h-screen relative z-10">
           {/* Sidebar */}
-          <aside className="w-full md:w-72 bg-white dark:bg-slate-900 border-b md:border-b-0 md:border-r border-slate-200 dark:border-slate-800 flex flex-col justify-between p-6 transition-colors duration-200">
+          <aside className="w-full md:w-72 bg-white/5 dark:bg-black/20 border-b md:border-b-0 md:border-r border-slate-200/10 dark:border-white/5 flex flex-col justify-between p-6 transition-colors duration-200 backdrop-blur-md">
             <div className="space-y-8">
               {/* Brand Header */}
-              <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center shadow-lg shadow-emerald-500/20">
-                  <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                  </svg>
-                </div>
-                <div>
-                  <span className="text-xl font-bold tracking-tight bg-gradient-to-r from-emerald-500 to-teal-400 bg-clip-text text-transparent">
-                    Mintry Fabric
-                  </span>
-                  <span className="block text-xs font-mono text-slate-400 dark:text-slate-500">
-                    FinOps TLS Proxy
-                  </span>
+              <div className="flex flex-col gap-5 items-start">
+                <Link href="/" className="nav-logo">
+                  MINTRY<span>.FABRIC</span>
+                </Link>
+                <div className="nav-pill">
+                  v1.0.4 Early Access
                 </div>
               </div>
 

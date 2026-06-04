@@ -122,7 +122,7 @@ export default function HomePage() {
   const displayChartData = chartData.length > 0 ? chartData : mockChartData;
 
   return (
-    <main className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 p-8 transition-colors duration-200">
+    <main className="min-h-screen w-full flex-1 p-8 transition-colors duration-200 relative z-10">
       <div className="mx-auto max-w-7xl space-y-8">
         {/* Header Banner */}
         <section className="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 p-8 md:p-10 shadow-xl shadow-slate-200/50 dark:shadow-none backdrop-blur-xl">
@@ -234,12 +234,12 @@ export default function HomePage() {
               <AreaChart data={displayChartData}>
                 <defs>
                   <linearGradient id="colorTotal" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#94a3b8" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="#94a3b8" stopOpacity={0} />
+                    <stop offset="5%" stopColor="#0066FF" stopOpacity={0.4} />
+                    <stop offset="95%" stopColor="#0066FF" stopOpacity={0} />
                   </linearGradient>
                   <linearGradient id="colorCached" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+                    <stop offset="5%" stopColor="#00E5A3" stopOpacity={0.4} />
+                    <stop offset="95%" stopColor="#00E5A3" stopOpacity={0} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" className="dark:hidden" />
@@ -266,7 +266,7 @@ export default function HomePage() {
                 <Area
                   type="monotone"
                   dataKey="totalRequests"
-                  stroke="#64748b"
+                  stroke="#0066FF"
                   strokeWidth={2}
                   fillOpacity={1}
                   fill="url(#colorTotal)"
@@ -276,7 +276,7 @@ export default function HomePage() {
                 <Area
                   type="monotone"
                   dataKey="cachedRequests"
-                  stroke="#10b981"
+                  stroke="#00E5A3"
                   strokeWidth={2}
                   fillOpacity={1}
                   fill="url(#colorCached)"

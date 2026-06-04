@@ -21,6 +21,13 @@ const config: Config = {
           800: '#065f46',
           900: '#064e3b',
         },
+        mint: {
+          DEFAULT: '#00E5A3',
+          glow: '#00FF87',
+        },
+        royal: {
+          DEFAULT: '#0066FF',
+        },
       },
     },
   },

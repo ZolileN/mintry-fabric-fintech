@@ -118,7 +118,7 @@ export default function FeedPage() {
   };
 
   return (
-    <main className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 p-8 transition-colors duration-200">
+    <main className="min-h-screen w-full flex-1 p-8 transition-colors duration-200 relative z-10">
       <div className="mx-auto max-w-7xl space-y-8">
         {/* Header */}
         <section className="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/90 p-8 shadow-xl shadow-slate-200/30 dark:shadow-none flex flex-col md:flex-row md:items-center md:justify-between gap-6">
