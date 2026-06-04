@@ -88,3 +88,29 @@ npm run dev
 - Cache duplicate outbound HTTPS verification requests.
 - Maintain compliance with POPIA/GDPR using encrypted local storage.
 - Provide an operational dashboard for policy configuration and telemetry.
+
+---
+
+## Supported Vendors
+
+Mintry Fabric ships with pre-configured routes for **15 South African fintech data suppliers** across 4 categories. TTLs are calibrated to each data type's volatility.
+
+| Category | Vendor | Default TTL | Rationale |
+|---|---|---|---|
+| **Credit, Risk & Property** | TransUnion SA | 30d | Credit scores update monthly |
+| | Experian SA | 30d | |
+| | Compuscan | 30d | |
+| | XDS | 30d | |
+| | Lightstone | 30d | Property valuations are slow-moving |
+| **Identity & KYC/KYB** | Smile ID | 90d | Identity data rarely changes |
+| | PBVerify | 90d | Home Affairs, CIPC lookups |
+| | ThisIsMe | 90d | |
+| | Windeed (LexisNexis) | 30d | Deeds & corporate records |
+| **Bank Verification & Open Banking** | BankservAfrica (AVS) | 7d | Account status can change |
+| | Stitch | 1d | Transactional data is live |
+| | TrueLayer | 1d | |
+| | Mono | 1d | |
+| **AML & Sanctions** | ComplyAdvantage | 7d | Sanctions lists update weekly |
+| | Dow Jones Risk & Compliance | 7d | |
+
+All routes are defined in [`runtime/config.yaml`](runtime/config.yaml). To add a new vendor, append a route entry with the endpoint pattern and desired TTL.

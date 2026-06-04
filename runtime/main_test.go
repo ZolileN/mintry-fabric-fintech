@@ -158,3 +158,71 @@ func TestFindRoute(t *testing.T) {
 		t.Fatal("expected no route match for api.google.com")
 	}
 }
+
+// TestLoadProductionConfig validates that config.yaml loads correctly and all
+// routes have valid TTLs that parse without error.
+func TestLoadProductionConfig(t *testing.T) {
+	cfg, err := loadConfig("config.yaml")
+	if err != nil {
+		t.Fatalf("failed to load config.yaml: %v", err)
+	}
+
+	if len(cfg.Routes) == 0 {
+		t.Fatal("config.yaml has no routes defined")
+	}
+
+	t.Logf("Loaded %d routes from config.yaml", len(cfg.Routes))
+
+	// Validate every route has a parseable TTL
+	for _, route := range cfg.Routes {
+		if route.Match == "" {
+			t.Fatal("found route with empty match pattern")
+		}
+		ttl, err := parseTTL(route.TTL)
+		if err != nil {
+			t.Fatalf("route %q has invalid TTL %q: %v", route.Match, route.TTL, err)
+		}
+		if ttl <= 0 {
+			t.Fatalf("route %q has non-positive TTL: %s", route.Match, ttl)
+		}
+	}
+
+	// Validate vendor host extraction
+	hosts := extractVendorHosts(cfg)
+	if len(hosts) == 0 {
+		t.Fatal("extracted zero vendor hosts from config")
+	}
+
+	t.Logf("Extracted %d unique vendor hosts: %v", len(hosts), hosts)
+
+	// Verify expected vendors are present
+	expectedHosts := []string{
+		"api.transunion.co.za",
+		"api.experian.co.za",
+		"api.compuscan.co.za",
+		"api.xds.co.za",
+		"api.lightstone.co.za",
+		"api.smileid.com",
+		"api.pbverify.co.za",
+		"api.thisisme.com",
+		"api.windeed.co.za",
+		"api.bankservafrica.com",
+		"api.stitch.money",
+		"api.truelayer.com",
+		"api.mono.co",
+		"api.complyadvantage.com",
+		"api.dowjones.com",
+	}
+
+	hostSet := make(map[string]bool)
+	for _, h := range hosts {
+		hostSet[h] = true
+	}
+
+	for _, expected := range expectedHosts {
+		if !hostSet[expected] {
+			t.Errorf("missing expected vendor host: %s", expected)
+		}
+	}
+}
+
