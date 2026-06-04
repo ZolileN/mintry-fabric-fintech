@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  mintry-sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mintry-sidecar
+    user: "10001:10001"
+    environment:
+      - MINTRY_SQLCIPHER_KEY=mintry_super_secret_key_1234
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - ./mintry-root.crt:/mintry-root.crt:ro
+      - ./mintry-root.key:/mintry-root.key:ro
+      - ./runtime/config.yaml:/app/config.yaml:ro
+      - ./cache:/app/cache # Volume for the sqlite database
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/routes"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  fintech-app:
+    image: alpine:latest
+    container_name: fintech-app
+    depends_on:
+      mintry-sidecar:
+        condition: service_healthy
+    environment:
+      - HTTP_PROXY=http://mintry-sidecar:8080
+      - HTTPS_PROXY=http://mintry-sidecar:8080
+    volumes:
+      - ./mintry-root.crt:/usr/local/share/ca-certificates/mintry-root.crt:ro
+    command: >
+      sh -c "
+      apk add --no-cache curl ca-certificates &&
+      update-ca-certificates &&
+      echo 'Fintech app started, sidecar is healthy...' &&
+      while true; do
+        echo '--- Making test request to TransUnion API through sidecar ---'
+        curl -v -sS https://api.transunion.co.za/v1/score > /dev/null
+        echo 'Sleeping for 10 seconds...'
+        sleep 10
+      done
+      "
