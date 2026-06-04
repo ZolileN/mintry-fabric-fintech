@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -18,6 +21,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -85,12 +89,22 @@ func main() {
 
 	store, err := newCacheStore(defaultDBPath)
 	if err != nil {
-		log.Fatalf("failed to initialize cache store: %v", err)
+		log.Printf("[WARN] failed to initialize cache store: %v. Starting in transparent bypass (pass-through) mode.", err)
+		store = &CacheStore{
+			db:      nil,
+			breaker: newCircuitBreaker(3, 5*time.Second, 150*time.Millisecond),
+		}
+		store.breaker.manualPassThrough = true
+		_ = telemetry.SetDB(nil)
+	} else {
+		defer store.db.Close()
+		if err := telemetry.SetDB(store.db); err != nil {
+			log.Printf("[WARN] failed to bind telemetry database: %v. Telemetry will run in-memory.", err)
+		}
+		go store.pruneExpiredLoop()
 	}
-	defer store.db.Close()
 
-	go store.pruneExpiredLoop()
-	go startTelemetryServer()
+	go startTelemetryServer(config, store)
 
 	// Load CA certificate for MITM interception
 	mintryCA, err := loadMintryCA(config.CACert, config.CAKey)
@@ -239,10 +253,13 @@ func vendorRouteCondition(cfg *Config) goproxy.ReqConditionFunc {
 
 // findRoute returns the first matching route config for a request.
 func findRoute(r *http.Request, cfg *Config) *RouteConfig {
+	configMu.RLock()
+	defer configMu.RUnlock()
 	target := strings.ToLower(r.Host + r.URL.Path)
 	for _, route := range cfg.Routes {
 		if strings.Contains(target, strings.ToLower(route.Match)) {
-			return &route
+			copied := route
+			return &copied
 		}
 	}
 	return nil
@@ -294,7 +311,8 @@ func makeCacheRequestHandler(cfg *Config, store *CacheStore) func(req *http.Requ
 			start := time.Now()
 			resp := buildCachedHTTPResponse(req, cached)
 			latencyMS := float64(time.Since(start).Microseconds()) / 1000.0
-			telemetry.RecordCacheHit(req.Host+req.URL.Path, latencyMS)
+			ttlRemaining := formatTTLRemaining(cached.ExpiresAt)
+			telemetry.RecordCacheHit(req.Host+req.URL.Path, latencyMS, ttlRemaining)
 			log.Printf("⚡ CACHE HIT  %s%s  (%.2fms)", req.Host, req.URL.Path, latencyMS)
 			return req, resp // short-circuit — vendor is never called
 		}
@@ -388,16 +406,51 @@ func buildCachedHTTPResponse(req *http.Request, cached *cachedResponse) *http.Re
 // Telemetry Server
 // ---------------------------------------------------------------------------
 
-func startTelemetryServer() {
+// WebSocket Broadcaster State
+type WSClient struct {
+	send chan []byte
+}
+
+var (
+	wsClients   = make(map[*WSClient]bool)
+	wsClientsMu sync.Mutex
+	configMu    sync.RWMutex
+)
+
+func broadcastInterception(entry cache.InterceptionLogEntry) {
+	msg, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+
+	wsClientsMu.Lock()
+	defer wsClientsMu.Unlock()
+	for client := range wsClients {
+		select {
+		case client.send <- msg:
+		default:
+			// Client's channel is full; drop frame
+		}
+	}
+}
+
+func startTelemetryServer(cfg *Config, store *CacheStore) {
+	// Hook up real-time interception alerts to WebSocket broadcaster
+	telemetry.OnInterception = broadcastInterception
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", handleTelemetry)
+	mux.HandleFunc("/api/routes", handleRoutesAPI(cfg))
+	mux.HandleFunc("/api/metrics/history", handleMetricsHistoryAPI(store))
+	mux.HandleFunc("/api/settings", handleSettingsAPI(store))
+	mux.HandleFunc("/ws/feed", handleWSFeed)
 
 	server := &http.Server{
 		Addr:    defaultTelemetryAddr,
 		Handler: mux,
 	}
 
-	log.Printf("Telemetry server started on %s", defaultTelemetryAddr)
+	log.Printf("Telemetry & Management API server started on %s", defaultTelemetryAddr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Printf("telemetry server error: %v", err)
 	}
@@ -406,6 +459,12 @@ func startTelemetryServer() {
 func handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
 	// Get memory stats
 	var m runtime.MemStats
@@ -418,19 +477,416 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
+func handleRoutesAPI(cfg *Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			data, err := os.ReadFile("config.yaml")
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to read config: %v", err), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"config_yaml": string(data),
+			})
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			var body struct {
+				ConfigYAML string `json:"config_yaml"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return
+			}
+
+			// Validate YAML syntax
+			var newCfg Config
+			if err := yaml.Unmarshal([]byte(body.ConfigYAML), &newCfg); err != nil {
+				http.Error(w, fmt.Sprintf("invalid YAML syntax: %v", err), http.StatusBadRequest)
+				return
+			}
+
+			// Write config.yaml to disk
+			if err := os.WriteFile("config.yaml", []byte(body.ConfigYAML), 0644); err != nil {
+				http.Error(w, fmt.Sprintf("failed to save config: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Hot-reload in memory
+			configMu.Lock()
+			cfg.Routes = newCfg.Routes
+			cfg.CACert = newCfg.CACert
+			cfg.CAKey = newCfg.CAKey
+			configMu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "success",
+				"message": "Configuration hot-reloaded successfully",
+			})
+			return
+		}
+
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+type ChartDataPoint struct {
+	Date           string `json:"date"`
+	TotalRequests  int    `json:"totalRequests"`
+	CachedRequests int    `json:"cachedRequests"`
+}
+
+func handleMetricsHistoryAPI(store *CacheStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Query historical metrics from DB
+		query := `
+			SELECT 
+				date(timestamp / 1000000000, 'unixepoch') as day,
+				COUNT(*) as total,
+				SUM(CASE WHEN action = 'CACHE_HIT' THEN 1 ELSE 0 END) as cached
+			FROM telemetry_log
+			GROUP BY day
+			ORDER BY day ASC
+			LIMIT 7;
+		`
+		if store == nil || store.db == nil {
+			log.Printf("[WARN] metrics history queried but database is offline")
+			json.NewEncoder(w).Encode([]ChartDataPoint{})
+			return
+		}
+		rows, err := store.db.QueryContext(r.Context(), query)
+		if err != nil {
+			log.Printf("[WARN] failed to query metrics history: %v", err)
+			json.NewEncoder(w).Encode([]ChartDataPoint{})
+			return
+		}
+		defer rows.Close()
+
+		var points []ChartDataPoint
+		for rows.Next() {
+			var p ChartDataPoint
+			if err := rows.Scan(&p.Date, &p.TotalRequests, &p.CachedRequests); err != nil {
+				log.Printf("[WARN] failed to scan history row: %v", err)
+				http.Error(w, "database scan error", http.StatusInternalServerError)
+				return
+			}
+			points = append(points, p)
+		}
+
+		// Fallback to empty days if database yields zero entries
+		if len(points) == 0 {
+			now := time.Now()
+			for i := 6; i >= 0; i-- {
+				day := now.AddDate(0, 0, -i).Format("2006-01-02")
+				points = append(points, ChartDataPoint{
+					Date:           day,
+					TotalRequests:  0,
+					CachedRequests: 0,
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(points)
+	}
+}
+
+func handleSettingsAPI(store *CacheStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			var totalCached int
+			var totalLogs int
+			if store != nil && store.db != nil {
+				_ = store.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM cache").Scan(&totalCached)
+				_ = store.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM telemetry_log").Scan(&totalLogs)
+			}
+
+			key := os.Getenv(encryptionKeyEnvVar)
+			encryptionEnabled := key != ""
+
+			breakerState := "CLOSED"
+			passThroughForced := false
+			if store != nil && store.breaker != nil {
+				store.breaker.mu.RLock()
+				breakerState = store.breaker.state.String()
+				passThroughForced = store.breaker.manualPassThrough
+				store.breaker.mu.RUnlock()
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"db_path":                 "cache.db",
+				"encryption_enabled":      encryptionEnabled,
+				"total_cached_records":    totalCached,
+				"total_telemetry_records": totalLogs,
+				"circuit_breaker_state":   breakerState,
+				"pass_through_forced":     passThroughForced,
+			})
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			var body struct {
+				Forced bool `json:"forced"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return
+			}
+
+			if store != nil && store.breaker != nil {
+				store.breaker.SetManualPassThrough(body.Forced)
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"status":              "success",
+				"pass_through_forced": body.Forced,
+			})
+			return
+		}
+
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func handleWSFeed(w http.ResponseWriter, r *http.Request) {
+	// CORS validation preflight
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "webserver doesn't support hijacking", http.StatusInternalServerError)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	// WebSocket handshake according to RFC 6455
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return
+	}
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	bufrw.WriteString("Upgrade: websocket\r\n")
+	bufrw.WriteString("Connection: Upgrade\r\n")
+	bufrw.WriteString("Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+	bufrw.Flush()
+
+	client := &WSClient{send: make(chan []byte, 100)}
+
+	wsClientsMu.Lock()
+	wsClients[client] = true
+	wsClientsMu.Unlock()
+
+	defer func() {
+		wsClientsMu.Lock()
+		delete(wsClients, client)
+		wsClientsMu.Unlock()
+	}()
+
+	// Discard loop to detect when the client closes connection
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			_, err := conn.Read(buf)
+			if err != nil {
+				conn.Close()
+				return
+			}
+		}
+	}()
+
+	// Write loop to stream data frames
+	for msg := range client.send {
+		length := len(msg)
+		var frame []byte
+		if length < 126 {
+			frame = []byte{0x81, byte(length)}
+		} else if length < 65536 {
+			frame = []byte{0x81, 126, byte(length >> 8), byte(length & 0xff)}
+		} else {
+			continue
+		}
+		frame = append(frame, msg...)
+
+		wsClientsMu.Lock()
+		_, err := conn.Write(frame)
+		wsClientsMu.Unlock()
+		if err != nil {
+			break
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // SQLite WAL Cache Store
 // ---------------------------------------------------------------------------
 
-// CacheStore manages the local SQLite cache backed by WAL.
+// CircuitState represents the operational state of the database circuit breaker.
+type CircuitState int
+
+const (
+	StateClosed CircuitState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+// CircuitBreaker acts as a failsafe gatekeeper. If database queries/writes fail or timeout
+// consecutively, it trips to StateOpen to bypass database calls entirely (transparent pass-through).
+type CircuitBreaker struct {
+	mu                sync.RWMutex
+	state             CircuitState
+	consecutiveFails  int
+	lastStateChange   time.Time
+	
+	failureThreshold  int
+	cooldown          time.Duration
+	opTimeout         time.Duration
+	manualPassThrough bool
+}
+
+func (s CircuitState) String() string {
+	switch s {
+	case StateClosed:
+		return "CLOSED"
+	case StateOpen:
+		return "OPEN"
+	case StateHalfOpen:
+		return "HALF-OPEN"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func newCircuitBreaker(threshold int, cooldown time.Duration, opTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:            StateClosed,
+		failureThreshold: threshold,
+		cooldown:         cooldown,
+		opTimeout:        opTimeout,
+		lastStateChange:  time.Now(),
+	}
+}
+
+func (cb *CircuitBreaker) SetManualPassThrough(val bool) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.manualPassThrough = val
+}
+
+func (cb *CircuitBreaker) GetManualPassThrough() bool {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.manualPassThrough
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.manualPassThrough {
+		return false
+	}
+
+	if cb.state == StateOpen {
+		if time.Since(cb.lastStateChange) > cb.cooldown {
+			cb.state = StateHalfOpen
+			cb.lastStateChange = time.Now()
+			log.Printf("[BREAKER] Cooldown elapsed. Transitioning from OPEN to HALF-OPEN.")
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.consecutiveFails = 0
+	if cb.state == StateHalfOpen {
+		cb.state = StateClosed
+		cb.lastStateChange = time.Now()
+		log.Printf("[BREAKER] DB operation succeeded in HALF-OPEN. Resetting breaker to CLOSED.")
+	}
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.consecutiveFails++
+	if cb.state == StateClosed && cb.consecutiveFails >= cb.failureThreshold {
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
+		log.Printf("[BREAKER] Consecutive database failures reached threshold (%d). Tripping breaker to OPEN.", cb.consecutiveFails)
+	} else if cb.state == StateHalfOpen {
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
+		log.Printf("[BREAKER] Database operation failed in HALF-OPEN. Breaker returned to OPEN.")
+	}
+}
+
+// CacheStore manages the local SQLite cache backed by WAL, protected by a circuit breaker.
 type CacheStore struct {
-	db *sql.DB
+	db      *sql.DB
+	breaker *CircuitBreaker
 }
 
 type cachedResponse struct {
-	Status  int
-	Headers http.Header
-	Body    []byte
+	Status    int
+	Headers   http.Header
+	Body      []byte
+	ExpiresAt int64
 }
 
 func newCacheStore(path string) (*CacheStore, error) {
@@ -480,33 +936,60 @@ func newCacheStore(path string) (*CacheStore, error) {
 		return nil, err
 	}
 
-	return &CacheStore{db: db}, nil
+	// Default circuit breaker config: 3 failures threshold, 5 seconds cooldown, 150ms timeout.
+	breaker := newCircuitBreaker(3, 5*time.Second, 150*time.Millisecond)
+
+	return &CacheStore{db: db, breaker: breaker}, nil
 }
 
 func (s *CacheStore) pruneExpiredLoop() {
+	if s == nil || s.db == nil {
+		return
+	}
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if _, err := s.db.Exec("DELETE FROM cache WHERE expires_at <= ?", time.Now().Unix()); err != nil {
+		if s.breaker != nil && !s.breaker.Allow() {
+			continue // skip pruning if breaker is tripped
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := s.db.ExecContext(ctx, "DELETE FROM cache WHERE expires_at <= ?", time.Now().Unix())
+		cancel()
+		if err != nil {
 			log.Printf("failed pruning expired cache rows: %v", err)
 		}
 	}
 }
 
 func (s *CacheStore) get(key string) (*cachedResponse, bool, error) {
-	row := s.db.QueryRow("SELECT status, headers, body, expires_at FROM cache WHERE key = ?", key)
+	if s.breaker != nil && !s.breaker.Allow() {
+		return nil, false, errors.New("circuit breaker is OPEN")
+	}
+
+	if s == nil || s.db == nil {
+		return nil, false, errors.New("database is offline")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.breaker.opTimeout)
+	defer cancel()
 
 	var status int
 	var headersJSON string
 	var body []byte
 	var expiresAt int64
+
+	row := s.db.QueryRowContext(ctx, "SELECT status, headers, body, expires_at FROM cache WHERE key = ?", key)
 	if err := row.Scan(&status, &headersJSON, &body, &expiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.breaker.RecordSuccess()
 			return nil, false, nil
 		}
+		s.breaker.RecordFailure()
 		return nil, false, err
 	}
+
+	s.breaker.RecordSuccess()
 
 	if time.Now().Unix() >= expiresAt {
 		return nil, false, nil
@@ -517,16 +1000,32 @@ func (s *CacheStore) get(key string) (*cachedResponse, bool, error) {
 		return nil, false, err
 	}
 
-	return &cachedResponse{Status: status, Headers: headers, Body: body}, true, nil
+	return &cachedResponse{
+		Status:    status,
+		Headers:   headers,
+		Body:      body,
+		ExpiresAt: expiresAt,
+	}, true, nil
 }
 
 func (s *CacheStore) put(key string, resp *cachedResponse, ttl time.Duration) error {
+	if s.breaker != nil && !s.breaker.Allow() {
+		return errors.New("circuit breaker is OPEN")
+	}
+
+	if s == nil || s.db == nil {
+		return errors.New("database is offline")
+	}
+
 	headersJSON, err := json.Marshal(resp.Headers)
 	if err != nil {
 		return err
 	}
 
-	_, err = s.db.Exec(
+	ctx, cancel := context.WithTimeout(context.Background(), s.breaker.opTimeout)
+	defer cancel()
+
+	_, err = s.db.ExecContext(ctx,
 		"INSERT INTO cache(key, status, headers, body, expires_at, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET status = excluded.status, headers = excluded.headers, body = excluded.body, expires_at = excluded.expires_at, created_at = excluded.created_at",
 		key,
 		resp.Status,
@@ -536,7 +1035,13 @@ func (s *CacheStore) put(key string, resp *cachedResponse, ttl time.Duration) er
 		time.Now().Unix(),
 	)
 
-	return err
+	if err != nil {
+		s.breaker.RecordFailure()
+		return err
+	}
+
+	s.breaker.RecordSuccess()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -624,4 +1129,27 @@ func parseTTL(ttl string) (time.Duration, error) {
 		return value * 24, nil
 	}
 	return time.ParseDuration(ttl)
+}
+
+func formatTTLRemaining(expiresAt int64) string {
+	remaining := time.Until(time.Unix(expiresAt, 0))
+	if remaining <= 0 {
+		return "expired"
+	}
+
+	days := int(remaining.Hours()) / 24
+	hours := int(remaining.Hours()) % 24
+	minutes := int(remaining.Minutes()) % 60
+	seconds := int(remaining.Seconds()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%dd %dh", days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm %ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }

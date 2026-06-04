@@ -1,0 +1,42 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlcipher-dev build-essential openssl
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: runtime/go.sum
+
+      - name: Run Tests
+        env:
+          MINTRY_SQLCIPHER_KEY: "ci-secret-passphrase-789!"
+        run: |
+          make test
+
+      - name: Build Local Binary
+        run: |
+          make build
+
+      - name: Build Docker Image
+        run: |
+          make docker-build

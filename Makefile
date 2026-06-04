@@ -2,7 +2,7 @@
 # Mintry Fabric Build Automation
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-.PHONY: all setup test build run clean
+.PHONY: all setup test build run clean docker-build docker-run
 
 # Compiler Settings
 GO := go
@@ -46,3 +46,26 @@ clean:
 	@rm -f mintry-runtime
 	@rm -rf runtime/lib
 	@rm -f runtime/integration_cache.db runtime/err_cache.db
+
+# Docker Targets
+.PHONY: docker-build docker-run
+
+docker-build: setup
+	@echo "🐳 Building Mintry Fabric runtime Docker image..."
+	docker build -t mintry-fabric-runtime:latest .
+
+docker-run: setup
+	@echo "🐳 Starting Mintry Fabric runtime container..."
+	@if [ -z "$$MINTRY_SQLCIPHER_KEY" ]; then \
+		echo "❌ Error: MINTRY_SQLCIPHER_KEY environment variable is not set!"; \
+		exit 1; \
+	fi
+	docker run -it --rm \
+		-p 8080:8080 \
+		-p 8081:8081 \
+		-v $(shell pwd)/runtime/config.yaml:/app/config.yaml \
+		-v $(shell pwd)/mintry-root.crt:/mintry-root.crt \
+		-v $(shell pwd)/mintry-root.key:/mintry-root.key \
+		-e MINTRY_SQLCIPHER_KEY="$$MINTRY_SQLCIPHER_KEY" \
+		mintry-fabric-runtime:latest
+
