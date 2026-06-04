@@ -1,0 +1,7 @@
+routes:
+  - match: "api.transunion.co.za/v1/score"
+    ttl: "30d"
+    cache_errors: false
+  - match: "api.smileid.com/v1/async/verify"
+    ttl: "7d"
+    cache_errors: false
